@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>knock — P2Pマッチングデモ</title>
+<style>
+  :root {
+    --bg: #0e0f12;
+    --bg-2: #16181d;
+    --fg: #e8e8e8;
+    --fg-dim: #8a8e96;
+    --line: #2a2d33;
+    --accent: #ffb547;
+    --ok: #6ec48f;
+    --warn: #e07a5f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 20px 60px;
+    line-height: 1.55;
+  }
+  .mono, code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  header {
+    width: 100%;
+    max-width: 680px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 14px;
+    margin-bottom: 28px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  h1 .glyph { color: var(--accent); margin-right: 6px; }
+  .status {
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--fg-dim);
+  }
+  .status .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--fg-dim);
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .status.gathering .dot { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  .status.connected .dot { background: var(--ok); }
+  .status.failed .dot { background: var(--warn); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  main { width: 100%; max-width: 680px; }
+  .step {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    padding: 20px;
+    margin-bottom: 14px;
+  }
+  .step h2 {
+    margin: 0 0 10px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--fg-dim);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .step p { margin: 0 0 14px; font-size: 14px; }
+  .role-tag {
+    padding: 2px 8px;
+    border: 1px solid var(--line);
+    font-family: ui-monospace, monospace;
+    font-size: 10px;
+    color: var(--fg-dim);
+    letter-spacing: 0.1em;
+  }
+  button {
+    background: var(--accent);
+    color: #1a1a1a;
+    border: none;
+    padding: 9px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    transition: opacity 0.15s;
+  }
+  button:hover:not(:disabled) { opacity: 0.85; }
+  button:disabled { opacity: 0.3; cursor: not-allowed; }
+  .url-box {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    padding: 10px;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    word-break: break-all;
+    margin-bottom: 10px;
+    max-height: 110px;
+    overflow-y: auto;
+    color: var(--fg-dim);
+  }
+  textarea {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--fg);
+    padding: 10px;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    resize: vertical;
+    min-height: 80px;
+  }
+  .actions { display: flex; gap: 8px; margin-top: 10px; }
+  .hidden { display: none; }
+  .hint { font-size: 12px; color: var(--fg-dim); margin-top: 8px; }
+  .stage { text-align: center; padding: 36px 20px 24px; }
+  .knock-btn {
+    background: var(--accent);
+    color: #1a1a1a;
+    border: none;
+    width: 180px;
+    height: 180px;
+    border-radius: 50%;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+    transition: transform 0.08s, box-shadow 0.15s;
+    box-shadow: 0 8px 24px rgba(255, 181, 71, 0.18);
+  }
+  .knock-btn:hover { box-shadow: 0 12px 32px rgba(255, 181, 71, 0.32); }
+  .knock-btn:active { transform: scale(0.94); }
+  .counter {
+    margin-top: 22px;
+    font-family: ui-monospace, monospace;
+    color: var(--fg-dim);
+    font-size: 13px;
+  }
+  .counter strong { color: var(--fg); font-size: 17px; padding: 0 4px; }
+  .flash {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    z-index: 100;
+  }
+  .flash.active { animation: flash 0.6s ease-out; }
+  @keyframes flash {
+    0%   { opacity: 1; box-shadow: inset 0 0 60px 8px var(--accent); }
+    100% { opacity: 0; box-shadow: inset 0 0 0 0 var(--accent); }
+  }
+  .toast {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-20px);
+    background: var(--accent);
+    color: #1a1a1a;
+    padding: 10px 20px;
+    font-weight: 600;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity 0.3s, transform 0.3s;
+    z-index: 101;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+
+<div class="flash" id="flash"></div>
+<div class="toast" id="toast">ノックされました</div>
+
+<header>
+  <h1><span class="glyph">◍</span> knock</h1>
+  <div class="status" id="status"><span class="dot"></span><span id="statusText">未接続</span></div>
+</header>
+
+<main>
+  <section class="step" id="step-init">
+    <h2>開始</h2>
+    <p>ブラウザ間で WebRTC (Web Real-Time Communication) P2P 接続を確立し、ボタンを押すと相手の画面に通知を表示します。<br>
+       URL の <code>#</code> フラグメントで SDP (Session Description Protocol) を受け渡す方式で、サーバは経由しません (STUN を除く)。</p>
+    <button onclick="startHost()">部屋を作る</button>
+    <p class="hint">招待 URL を作って相手に送る側になります。相手が URL を開くと自動的にゲストとして参加します。</p>
+  </section>
+
+  <section class="step hidden" id="step-host-share">
+    <h2>① 招待 URL を送る <span class="role-tag">host</span></h2>
+    <p>下の URL をコピーして相手に送ってください。</p>
+    <div class="url-box mono" id="offerUrl"></div>
+    <div class="actions">
+      <button onclick="copyText('offerUrl')">URL をコピー</button>
+    </div>
+  </section>
+
+  <section class="step hidden" id="step-host-receive">
+    <h2>② 相手の返信 URL を貼り付ける <span class="role-tag">host</span></h2>
+    <p>相手から返ってきた URL をそのまま貼り付けてください。</p>
+    <textarea id="answerInput" placeholder="https://... または answer=... の部分"></textarea>
+    <div class="actions">
+      <button onclick="acceptAnswer()">接続</button>
+    </div>
+  </section>
+
+  <section class="step hidden" id="step-guest-share">
+    <h2>返信 URL をホストに送る <span class="role-tag">guest</span></h2>
+    <p>下の URL をコピーしてホストに送り返してください。</p>
+    <div class="url-box mono" id="answerUrl"></div>
+    <div class="actions">
+      <button onclick="copyText('answerUrl')">URL をコピー</button>
+    </div>
+  </section>
+
+  <section class="step hidden" id="step-connected">
+    <div class="stage">
+      <button class="knock-btn" onclick="sendKnock()">ノック</button>
+      <div class="counter">
+        受信 <strong id="recvCount">0</strong> &nbsp;|&nbsp; 送信 <strong id="sentCount">0</strong>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const STUN = [{urls: 'stun:stun.l.google.com:19302'}];
+let pc = null, dc = null, role = null;
+let sentCount = 0, recvCount = 0;
+
+function b64encode(obj) {
+  return btoa(JSON.stringify(obj))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+function b64decode(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return JSON.parse(atob(s));
+}
+const $ = id => document.getElementById(id);
+const show = id => $(id).classList.remove('hidden');
+const hide = id => $(id).classList.add('hidden');
+
+function setStatus(text, cls) {
+  $('status').className = 'status' + (cls ? ' ' + cls : '');
+  $('statusText').textContent = text;
+}
+
+function waitIce(pc) {
+  return new Promise(resolve => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const handler = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', handler);
+        resolve();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', handler);
+    setTimeout(resolve, 3000); // fallback
+  });
+}
+
+function setupPc() {
+  pc = new RTCPeerConnection({iceServers: STUN});
+  pc.addEventListener('connectionstatechange', () => {
+    if (pc.connectionState === 'connected') setStatus('接続中', 'connected');
+    else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')
+      setStatus('切断', 'failed');
+  });
+}
+
+function setupDc(channel) {
+  dc = channel;
+  dc.onopen = () => {
+    hide('step-host-share'); hide('step-host-receive'); hide('step-guest-share');
+    show('step-connected');
+    setStatus('接続中', 'connected');
+  };
+  dc.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'knock') {
+        recvCount++;
+        $('recvCount').textContent = recvCount;
+        triggerNotification();
+      }
+    } catch (err) {}
+  };
+  dc.onclose = () => setStatus('切断', 'failed');
+}
+
+function baseUrl() { return location.href.split('#')[0]; }
+
+async function startHost() {
+  role = 'host';
+  hide('step-init');
+  setStatus('ICE 収集中...', 'gathering');
+  setupPc();
+  setupDc(pc.createDataChannel('knock'));
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitIce(pc);
+  $('offerUrl').textContent = baseUrl() + '#offer=' + b64encode(pc.localDescription);
+  show('step-host-share');
+  show('step-host-receive');
+  setStatus('相手の返信待ち', 'gathering');
+}
+
+async function startGuest(offerB64) {
+  role = 'guest';
+  hide('step-init');
+  setStatus('ICE 収集中...', 'gathering');
+  setupPc();
+  pc.addEventListener('datachannel', e => setupDc(e.channel));
+  try {
+    await pc.setRemoteDescription(b64decode(offerB64));
+  } catch (err) {
+    setStatus('招待 URL が無効です', 'failed');
+    show('step-init');
+    return;
+  }
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitIce(pc);
+  $('answerUrl').textContent = baseUrl() + '#answer=' + b64encode(pc.localDescription);
+  show('step-guest-share');
+  setStatus('ホストの応答待ち', 'gathering');
+}
+
+async function acceptAnswer() {
+  let input = $('answerInput').value.trim();
+  if (!input) return;
+  try {
+    let frag = input.includes('#') ? input.split('#').pop() : input;
+    if (frag.startsWith('answer=')) frag = frag.slice('answer='.length);
+    await pc.setRemoteDescription(b64decode(frag));
+    setStatus('接続中...', 'gathering');
+  } catch (err) {
+    alert('URL の解析に失敗しました: ' + err.message);
+  }
+}
+
+function copyText(id) {
+  navigator.clipboard.writeText($(id).textContent).then(
+    () => showToast('コピーしました'),
+    () => showToast('コピー失敗 — 手動で選択してください')
+  );
+}
+
+function sendKnock() {
+  if (!dc || dc.readyState !== 'open') return;
+  dc.send(JSON.stringify({type: 'knock', t: Date.now()}));
+  sentCount++;
+  $('sentCount').textContent = sentCount;
+}
+
+function triggerNotification() {
+  const flash = $('flash');
+  flash.classList.remove('active');
+  void flash.offsetWidth;
+  flash.classList.add('active');
+  showToast('ノックされました');
+  if (navigator.vibrate) navigator.vibrate(50);
+}
+
+function showToast(text) {
+  const toast = $('toast');
+  toast.textContent = text;
+  toast.classList.add('show');
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toast.classList.remove('show'), 1500);
+}
+
+// Auto-route based on fragment
+(function init() {
+  const frag = location.hash.slice(1);
+  if (frag.startsWith('offer=')) startGuest(frag.slice('offer='.length));
+})();
+</script>
+
+</body>
+</html>
