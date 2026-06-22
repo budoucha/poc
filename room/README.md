@@ -77,7 +77,7 @@ Offer 側はカメラアプリでそのまま開けるように full URL を QR 
 {"type": "knock", "t": 1718870400000}
 ```
 
-受信側は `dc.onmessage` でハンドルし、画面端のオレンジフラッシュとトースト通知、可能なら `navigator.vibrate(50)` を発火する。
+受信側は `dc.onmessage` でハンドルし、画面端のオレンジフラッシュとトースト通知、可能なら `navigator.vibrate(80)` を発火する。
 
 ## NAT 越えと接続成立条件
 

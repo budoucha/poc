@@ -1076,7 +1076,11 @@ function triggerNotification() {
   void flash.offsetWidth;
   flash.classList.add('active');
   showToast('ノックされました');
-  if (navigator.vibrate) navigator.vibrate(50);
+  vibrateOnKnock();
+}
+
+function vibrateOnKnock() {
+  if (navigator.vibrate) navigator.vibrate(80);
 }
 
 function showToast(text) {
