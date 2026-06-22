@@ -116,6 +116,36 @@
     overflow-y: auto;
     color: var(--fg-dim);
   }
+  .qr-panel {
+    background: #fff;
+    border: 1px solid var(--line);
+    padding: 14px;
+    margin: 10px 0;
+    display: inline-block;
+    max-width: 100%;
+  }
+  .qr-panel canvas {
+    display: block;
+    width: min(100%, 640px);
+    height: auto;
+    image-rendering: pixelated;
+  }
+  .scan-panel {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    padding: 10px;
+    margin-top: 10px;
+  }
+  .scan-panel video {
+    display: block;
+    width: 100%;
+    max-height: 360px;
+    background: #000;
+    object-fit: cover;
+  }
+  .scan-panel video.hidden {
+    display: none;
+  }
   textarea {
     width: 100%;
     background: var(--bg);
@@ -205,7 +235,10 @@
 
   <section class="step hidden" id="step-host-share">
     <h2>① 招待 URL を送る <span class="role-tag">host</span></h2>
-    <p>下の URL をコピーして相手に送ってください。</p>
+    <p>下の QR をカメラアプリで読み取るか、URL をコピーして相手に送ってください。</p>
+    <div class="qr-panel hidden" id="offerQrPanel">
+      <canvas id="offerQr"></canvas>
+    </div>
     <div class="url-box mono" id="offerUrl"></div>
     <div class="actions">
       <button onclick="copyText('offerUrl')">URL をコピー</button>
@@ -214,19 +247,32 @@
 
   <section class="step hidden" id="step-host-receive">
     <h2>② 相手の返信 URL を貼り付ける <span class="role-tag">host</span></h2>
-    <p>相手から返ってきた URL をそのまま貼り付けてください。</p>
-    <textarea id="answerInput" placeholder="https://... または answer=... の部分"></textarea>
+    <p>相手から返ってきた返信内容をそのまま貼り付けてください。</p>
+    <textarea id="answerInput" placeholder="answer=az1:... / https://... / answer=..."></textarea>
     <div class="actions">
       <button onclick="acceptAnswer()">接続</button>
+      <button onclick="startAnswerQrScan()">返信 QR を読み取る</button>
+      <button onclick="openAnswerQrImagePicker()">QR 画像を読み取る</button>
+    </div>
+    <input class="hidden" id="answerQrImageInput" type="file" accept="image/*" capture="environment" onchange="readAnswerQrImage(this.files && this.files[0])">
+    <div class="scan-panel hidden" id="answerScanPanel">
+      <video id="answerScanVideo" autoplay muted playsinline></video>
+      <p class="hint" id="answerScanMessage">返信 QR をカメラに映してください。</p>
+      <div class="actions">
+        <button onclick="stopAnswerQrScan()">読み取りを停止</button>
+      </div>
     </div>
   </section>
 
   <section class="step hidden" id="step-guest-share">
-    <h2>返信 URL をホストに送る <span class="role-tag">guest</span></h2>
-    <p>下の URL をコピーしてホストに送り返してください。</p>
+    <h2>返信内容をホストに送る <span class="role-tag">guest</span></h2>
+    <p>下の圧縮済み返信内容をホストに送り返してください。QR には同じ内容が入っています。</p>
+    <div class="qr-panel hidden" id="answerQrPanel">
+      <canvas id="answerQr"></canvas>
+    </div>
     <div class="url-box mono" id="answerUrl"></div>
     <div class="actions">
-      <button onclick="copyText('answerUrl')">URL をコピー</button>
+      <button onclick="copyText('answerUrl')">返信内容をコピー</button>
     </div>
   </section>
 
@@ -240,10 +286,14 @@
   </section>
 </main>
 
+<script src="vendor/jsQR.js"></script>
 <script>
 const STUN = [{urls: 'stun:stun.l.google.com:19302'}];
 let pc = null, dc = null, role = null;
 let sentCount = 0, recvCount = 0;
+let answerScanStream = null;
+let answerScanFrame = 0;
+let answerScanCanvas = null;
 
 function b64encode(obj) {
   return btoa(JSON.stringify(obj))
@@ -253,6 +303,67 @@ function b64decode(s) {
   s = s.replace(/-/g, '+').replace(/_/g, '/');
   while (s.length % 4) s += '=';
   return JSON.parse(atob(s));
+}
+function bytesToB64url(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const binary = atob(s);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+async function gzipText(text) {
+  if (!window.CompressionStream) return null;
+  const stream = new CompressionStream('gzip');
+  const writer = stream.writable.getWriter();
+  writer.write(new TextEncoder().encode(text));
+  writer.close();
+  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+}
+async function gunzipText(bytes) {
+  if (!window.DecompressionStream) throw new Error('このブラウザは圧縮済み answer の展開に対応していません');
+  const stream = new DecompressionStream('gzip');
+  const writer = stream.writable.getWriter();
+  writer.write(bytes);
+  writer.close();
+  return new Response(stream.readable).text();
+}
+async function encodeAnswerPayload(desc) {
+  const json = JSON.stringify(desc);
+  const compressed = await gzipText(json);
+  if (!compressed) return 'answer=' + b64encode(desc);
+  return 'answer=az1:' + bytesToB64url(compressed);
+}
+async function encodeOfferPayload(desc) {
+  const json = JSON.stringify(desc);
+  const compressed = await gzipText(json);
+  if (!compressed) return 'offer=' + b64encode(desc);
+  return 'offer=oz1:' + bytesToB64url(compressed);
+}
+async function decodeOfferPayload(input) {
+  let frag = input.includes('#') ? input.split('#').pop() : input;
+  if (frag.startsWith('offer=')) frag = frag.slice('offer='.length);
+  frag = frag.split('&')[0];
+  if (frag.startsWith('oz1:')) {
+    return JSON.parse(await gunzipText(b64urlToBytes(frag.slice('oz1:'.length))));
+  }
+  return b64decode(frag);
+}
+async function decodeAnswerPayload(input) {
+  let frag = input.includes('#') ? input.split('#').pop() : input;
+  if (frag.startsWith('answer=')) frag = frag.slice('answer='.length);
+  frag = frag.split('&')[0];
+  if (frag.startsWith('az1:')) {
+    return JSON.parse(await gunzipText(b64urlToBytes(frag.slice('az1:'.length))));
+  }
+  return b64decode(frag);
 }
 const $ = id => document.getElementById(id);
 const show = id => $(id).classList.remove('hidden');
@@ -289,6 +400,7 @@ function setupPc() {
 function setupDc(channel) {
   dc = channel;
   dc.onopen = () => {
+    stopAnswerQrScan();
     hide('step-host-share'); hide('step-host-receive'); hide('step-guest-share');
     show('step-connected');
     setStatus('接続中', 'connected');
@@ -317,7 +429,9 @@ async function startHost() {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   await waitIce(pc);
-  $('offerUrl').textContent = baseUrl() + '#offer=' + b64encode(pc.localDescription);
+  const offerUrl = baseUrl() + '#' + await encodeOfferPayload(pc.localDescription);
+  $('offerUrl').textContent = offerUrl;
+  renderOfferQr(offerUrl);
   show('step-host-share');
   show('step-host-receive');
   setStatus('相手の返信待ち', 'gathering');
@@ -330,7 +444,7 @@ async function startGuest(offerB64) {
   setupPc();
   pc.addEventListener('datachannel', e => setupDc(e.channel));
   try {
-    await pc.setRemoteDescription(b64decode(offerB64));
+    await pc.setRemoteDescription(await decodeOfferPayload(offerB64));
   } catch (err) {
     setStatus('招待 URL が無効です', 'failed');
     show('step-init');
@@ -339,22 +453,607 @@ async function startGuest(offerB64) {
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
   await waitIce(pc);
-  $('answerUrl').textContent = baseUrl() + '#answer=' + b64encode(pc.localDescription);
+  const answerPayload = await encodeAnswerPayload(pc.localDescription);
+  $('answerUrl').textContent = answerPayload;
+  renderAnswerQr(answerPayload);
   show('step-guest-share');
   setStatus('ホストの応答待ち', 'gathering');
 }
 
 async function acceptAnswer() {
-  let input = $('answerInput').value.trim();
+  return acceptAnswerText($('answerInput').value);
+}
+
+async function acceptAnswerText(input) {
+  input = input.trim();
   if (!input) return;
   try {
-    let frag = input.includes('#') ? input.split('#').pop() : input;
-    if (frag.startsWith('answer=')) frag = frag.slice('answer='.length);
-    await pc.setRemoteDescription(b64decode(frag));
+    await pc.setRemoteDescription(await decodeAnswerPayload(input));
     setStatus('接続中...', 'gathering');
   } catch (err) {
     alert('URL の解析に失敗しました: ' + err.message);
   }
+}
+
+async function startAnswerQrScan() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showAnswerScanUnavailable('カメラ API が利用できません。' + cameraContextHint());
+    showToast('カメラ API が利用できません');
+    return;
+  }
+
+  try {
+    let detector = null;
+    if (window.BarcodeDetector) {
+      try {
+        if (BarcodeDetector.getSupportedFormats) {
+          const formats = await BarcodeDetector.getSupportedFormats();
+          if (!formats.includes('qr_code')) throw new Error('qr_code is unsupported');
+        }
+        detector = new BarcodeDetector({formats: ['qr_code']});
+      } catch (err) {
+        detector = null;
+      }
+    }
+    if (!detector && typeof window.jsQR !== 'function') {
+      showToast('QR 読み取り機能を読み込めません');
+      return;
+    }
+
+    stopAnswerQrScan();
+    const video = $('answerScanVideo');
+    video.classList.remove('hidden');
+    answerScanStream = await navigator.mediaDevices.getUserMedia({
+      video: {facingMode: {ideal: 'environment'}},
+      audio: false
+    });
+    video.srcObject = answerScanStream;
+    show('answerScanPanel');
+    $('answerScanMessage').textContent = detector
+      ? '返信 QR をカメラに映してください。'
+      : '返信 QR をカメラに映してください。互換モードで読み取ります。';
+    await video.play();
+
+    scanAnswerQr({detector}, video);
+  } catch (err) {
+    stopAnswerQrScan();
+    showAnswerScanUnavailable(cameraErrorMessage(err));
+    showToast('QR 読み取りを開始できません');
+  }
+}
+
+async function scanAnswerQr(scanner, video) {
+  if (!answerScanStream) return;
+  try {
+    const text = await detectQrText(scanner, video);
+    if (text) {
+      $('answerInput').value = text;
+      stopAnswerQrScan();
+      showToast('QR を読み取りました');
+      await acceptAnswerText(text);
+      return;
+    }
+  } catch (err) {
+    $('answerScanMessage').textContent = '読み取り中に問題が起きました。貼り付け入力も使えます。';
+  }
+  answerScanFrame = requestAnimationFrame(() => scanAnswerQr(scanner, video));
+}
+
+async function detectQrText(scanner, video) {
+  if (scanner.detector) {
+    const codes = await scanner.detector.detect(video);
+    return codes.find(code => code.rawValue)?.rawValue || '';
+  }
+  if (typeof window.jsQR !== 'function') return '';
+  if (!video.videoWidth || !video.videoHeight) return '';
+
+  if (!answerScanCanvas) answerScanCanvas = document.createElement('canvas');
+  const maxSide = 900;
+  const scale = Math.min(1, maxSide / Math.max(video.videoWidth, video.videoHeight));
+  answerScanCanvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+  answerScanCanvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+  const ctx = answerScanCanvas.getContext('2d', {willReadFrequently: true});
+  ctx.drawImage(video, 0, 0, answerScanCanvas.width, answerScanCanvas.height);
+  const image = ctx.getImageData(0, 0, answerScanCanvas.width, answerScanCanvas.height);
+  const code = window.jsQR(image.data, image.width, image.height, {
+    inversionAttempts: 'attemptBoth'
+  });
+  return code ? code.data : '';
+}
+
+function openAnswerQrImagePicker() {
+  const input = $('answerQrImageInput');
+  input.value = '';
+  input.click();
+}
+
+async function readAnswerQrImage(file) {
+  if (!file) return;
+  if (typeof window.jsQR !== 'function') {
+    showToast('QR 読み取り機能を読み込めません');
+    return;
+  }
+
+  try {
+    const image = await loadImageFromFile(file);
+    if (!answerScanCanvas) answerScanCanvas = document.createElement('canvas');
+    const maxSide = 1400;
+    const scale = Math.min(1, maxSide / Math.max(image.naturalWidth || image.width, image.naturalHeight || image.height));
+    answerScanCanvas.width = Math.max(1, Math.round((image.naturalWidth || image.width) * scale));
+    answerScanCanvas.height = Math.max(1, Math.round((image.naturalHeight || image.height) * scale));
+    const ctx = answerScanCanvas.getContext('2d', {willReadFrequently: true});
+    ctx.drawImage(image, 0, 0, answerScanCanvas.width, answerScanCanvas.height);
+    const data = ctx.getImageData(0, 0, answerScanCanvas.width, answerScanCanvas.height);
+    const code = window.jsQR(data.data, data.width, data.height, {
+      inversionAttempts: 'attemptBoth'
+    });
+    if (!code || !code.data) {
+      showToast('QR を読み取れませんでした');
+      $('answerScanMessage').textContent = 'QR を読み取れませんでした。QR が大きく鮮明に写った画像で再試行してください。';
+      show('answerScanPanel');
+      return;
+    }
+    $('answerInput').value = code.data;
+    showToast('QR を読み取りました');
+    await acceptAnswerText(code.data);
+  } catch (err) {
+    showToast('画像の読み取りに失敗しました');
+    $('answerScanMessage').textContent = '画像の読み取りに失敗しました: ' + err.message;
+    show('answerScanPanel');
+  }
+}
+
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('画像を開けません'));
+    };
+    image.src = url;
+  });
+}
+
+function stopAnswerQrScan() {
+  if (answerScanFrame) {
+    cancelAnimationFrame(answerScanFrame);
+    answerScanFrame = 0;
+  }
+  if (answerScanStream) {
+    answerScanStream.getTracks().forEach(track => track.stop());
+    answerScanStream = null;
+  }
+  const video = $('answerScanVideo');
+  if (video) video.srcObject = null;
+  hide('answerScanPanel');
+}
+
+function showAnswerScanUnavailable(message) {
+  const video = $('answerScanVideo');
+  if (video) {
+    video.srcObject = null;
+    video.classList.add('hidden');
+  }
+  $('answerScanMessage').textContent = message + ' QR 画像を読み取るボタン、または貼り付け入力を使ってください。';
+  show('answerScanPanel');
+}
+
+function cameraContextHint() {
+  const origin = location.protocol === 'file:' ? 'file://' : location.origin;
+  if (!window.isSecureContext) {
+    return ' 現在のページは安全なコンテキストではありません (' + origin + ')。カメラは HTTPS、localhost、または対応ブラウザの file:// でのみ使えます。';
+  }
+  return ' 現在のページ: ' + origin + '。このブラウザまたは表示方法では getUserMedia が無効です。';
+}
+
+function cameraErrorMessage(err) {
+  const name = err && err.name ? err.name : '';
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+    return 'カメラ権限が拒否されました。ブラウザのサイト設定でカメラを許可してください。';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return '利用できるカメラが見つかりません。';
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return 'カメラを開始できません。他のアプリが使用中の可能性があります。';
+  }
+  if (name === 'SecurityError') {
+    return 'セキュリティ制限でカメラを開始できません。' + cameraContextHint();
+  }
+  return 'カメラを開始できません: ' + (err && err.message ? err.message : name || 'unknown error') + '。' + cameraContextHint();
+}
+
+function renderOfferQr(text) {
+  try {
+    drawQrCode(text, $('offerQr'));
+    show('offerQrPanel');
+  } catch (err) {
+    hide('offerQrPanel');
+    showToast('招待 QR 生成を省略しました: ' + err.message);
+  }
+}
+
+function renderAnswerQr(text) {
+  try {
+    drawQrCode(text, $('answerQr'));
+    show('answerQrPanel');
+  } catch (err) {
+    hide('answerQrPanel');
+    showToast('QR 生成を省略しました: ' + err.message);
+  }
+}
+
+function drawQrCode(text, canvas) {
+  const modules = makeQrCode(text);
+  const border = 4;
+  const scale = 6;
+  const size = modules.length;
+  canvas.width = (size + border * 2) * scale;
+  canvas.height = canvas.width;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#000';
+  for (let row = 0; row < size; row++) {
+    for (let col = 0; col < size; col++) {
+      if (modules[row][col]) {
+        ctx.fillRect((col + border) * scale, (row + border) * scale, scale, scale);
+      }
+    }
+  }
+}
+
+const QR_L_DATA_CODEWORDS = [
+  19, 34, 55, 80, 108, 136, 156, 194, 232, 274,
+  324, 370, 428, 461, 523, 589, 647, 721, 795, 861,
+  932, 1006, 1094, 1174, 1276, 1370, 1468, 1531, 1631, 1735,
+  1843, 1955, 2071, 2191, 2306, 2434, 2566, 2702, 2812, 2956
+];
+const QR_L_ECC_PER_BLOCK = [
+  7, 10, 15, 20, 26, 18, 20, 24, 30, 18,
+  20, 24, 26, 30, 22, 24, 28, 30, 28, 28,
+  28, 28, 30, 30, 26, 28, 30, 30, 30, 30,
+  30, 30, 30, 30, 30, 30, 30, 30, 30, 30
+];
+const QR_L_BLOCK_COUNT = [
+  1, 1, 1, 1, 1, 2, 2, 2, 2, 4,
+  4, 4, 4, 4, 6, 6, 6, 6, 7, 8,
+  8, 9, 9, 10, 12, 12, 12, 13, 14, 15,
+  16, 17, 18, 19, 19, 20, 21, 22, 24, 25
+];
+const QR_ALIGNMENT_POSITIONS = [
+  [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34],
+  [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50],
+  [6, 30, 54], [6, 32, 58], [6, 34, 62], [6, 26, 46, 66],
+  [6, 26, 48, 70], [6, 26, 50, 74], [6, 30, 54, 78],
+  [6, 30, 56, 82], [6, 30, 58, 86], [6, 34, 62, 90],
+  [6, 28, 50, 72, 94], [6, 26, 50, 74, 98],
+  [6, 30, 54, 78, 102], [6, 28, 54, 80, 106],
+  [6, 32, 58, 84, 110], [6, 30, 58, 86, 114],
+  [6, 34, 62, 90, 118], [6, 26, 50, 74, 98, 122],
+  [6, 30, 54, 78, 102, 126], [6, 26, 52, 78, 104, 130],
+  [6, 30, 56, 82, 108, 134], [6, 34, 60, 86, 112, 138],
+  [6, 30, 58, 86, 114, 142], [6, 34, 62, 90, 118, 146],
+  [6, 30, 54, 78, 102, 126, 150], [6, 24, 50, 76, 102, 128, 154],
+  [6, 28, 54, 80, 106, 132, 158], [6, 32, 58, 84, 110, 136, 162],
+  [6, 26, 54, 82, 110, 138, 166], [6, 30, 58, 86, 114, 142, 170]
+];
+
+function makeQrCode(text) {
+  const bytes = new TextEncoder().encode(text);
+  const version = chooseQrVersion(bytes.length);
+  const size = version * 4 + 17;
+  const dataCodewords = QR_L_DATA_CODEWORDS[version - 1];
+  const eccPerBlock = QR_L_ECC_PER_BLOCK[version - 1];
+  const blockCount = QR_L_BLOCK_COUNT[version - 1];
+  const shortBlockLen = Math.floor(dataCodewords / blockCount);
+  const longBlockCount = dataCodewords % blockCount;
+  const blockSizes = [
+    ...Array(blockCount - longBlockCount).fill(shortBlockLen),
+    ...Array(longBlockCount).fill(shortBlockLen + 1)
+  ];
+
+  const data = makeQrDataCodewords(bytes, dataCodewords, version);
+  const blocks = [];
+  let offset = 0;
+  const generator = rsGenerator(eccPerBlock);
+  for (const len of blockSizes) {
+    const block = data.slice(offset, offset + len);
+    offset += len;
+    blocks.push({data: block, ecc: rsRemainder(block, generator)});
+  }
+
+  const codewords = [];
+  const maxBlockLen = Math.max(...blockSizes);
+  for (let i = 0; i < maxBlockLen; i++) {
+    for (const block of blocks) if (i < block.data.length) codewords.push(block.data[i]);
+  }
+  for (let i = 0; i < eccPerBlock; i++) {
+    for (const block of blocks) codewords.push(block.ecc[i]);
+  }
+
+  const baseModules = Array.from({length: size}, () => Array(size).fill(false));
+  const reserved = Array.from({length: size}, () => Array(size).fill(false));
+  const setFunc = (row, col, dark) => {
+    if (0 <= row && row < size && 0 <= col && col < size) {
+      baseModules[row][col] = dark;
+      reserved[row][col] = true;
+    }
+  };
+
+  drawFinder(setFunc, 0, 0);
+  drawFinder(setFunc, 0, size - 7);
+  drawFinder(setFunc, size - 7, 0);
+  const align = QR_ALIGNMENT_POSITIONS[version - 1];
+  for (let i = 0; i < align.length; i++) {
+    for (let j = 0; j < align.length; j++) {
+      if ((i === 0 && j === 0) || (i === 0 && j === align.length - 1) || (i === align.length - 1 && j === 0)) continue;
+      drawAlignment(setFunc, align[i], align[j]);
+    }
+  }
+  for (let i = 8; i < size - 8; i++) {
+    setFunc(6, i, i % 2 === 0);
+    setFunc(i, 6, i % 2 === 0);
+  }
+  drawFormatBits(setFunc, size, 0);
+  if (version >= 7) drawVersionBits(setFunc, size, version);
+
+  let bestModules = null;
+  let bestPenalty = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    const modules = baseModules.map(row => row.slice());
+    const candidateSetFunc = (row, col, dark) => {
+      if (0 <= row && row < size && 0 <= col && col < size) modules[row][col] = dark;
+    };
+    drawFormatBits(candidateSetFunc, size, mask);
+    placeQrData(modules, reserved, codewords, mask);
+    const penalty = scoreQrMask(modules);
+    if (penalty < bestPenalty) {
+      bestPenalty = penalty;
+      bestModules = modules;
+    }
+  }
+  return bestModules;
+}
+
+function placeQrData(modules, reserved, codewords, mask) {
+  const size = modules.length;
+  let bitIndex = 0;
+  let upward = true;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right--;
+    for (let vert = 0; vert < size; vert++) {
+      const row = upward ? size - 1 - vert : vert;
+      for (let j = 0; j < 2; j++) {
+        const col = right - j;
+        if (reserved[row][col]) continue;
+        const bit = bitIndex < codewords.length * 8
+          ? ((codewords[bitIndex >>> 3] >>> (7 - (bitIndex & 7))) & 1) !== 0
+          : false;
+        modules[row][col] = bit !== isQrMaskDark(mask, row, col);
+        bitIndex++;
+      }
+    }
+    upward = !upward;
+  }
+}
+
+function isQrMaskDark(mask, row, col) {
+  switch (mask) {
+    case 0: return (row + col) % 2 === 0;
+    case 1: return row % 2 === 0;
+    case 2: return col % 3 === 0;
+    case 3: return (row + col) % 3 === 0;
+    case 4: return (Math.floor(row / 2) + Math.floor(col / 3)) % 2 === 0;
+    case 5: return ((row * col) % 2 + (row * col) % 3) === 0;
+    case 6: return (((row * col) % 2 + (row * col) % 3) % 2) === 0;
+    case 7: return (((row + col) % 2 + (row * col) % 3) % 2) === 0;
+  }
+  return false;
+}
+
+function scoreQrMask(modules) {
+  const size = modules.length;
+  let penalty = 0;
+
+  for (let row = 0; row < size; row++) {
+    let runColor = modules[row][0];
+    let runLen = 1;
+    for (let col = 1; col < size; col++) {
+      if (modules[row][col] === runColor) {
+        runLen++;
+      } else {
+        if (runLen >= 5) penalty += runLen - 2;
+        runColor = modules[row][col];
+        runLen = 1;
+      }
+    }
+    if (runLen >= 5) penalty += runLen - 2;
+  }
+
+  for (let col = 0; col < size; col++) {
+    let runColor = modules[0][col];
+    let runLen = 1;
+    for (let row = 1; row < size; row++) {
+      if (modules[row][col] === runColor) {
+        runLen++;
+      } else {
+        if (runLen >= 5) penalty += runLen - 2;
+        runColor = modules[row][col];
+        runLen = 1;
+      }
+    }
+    if (runLen >= 5) penalty += runLen - 2;
+  }
+
+  for (let row = 0; row < size - 1; row++) {
+    for (let col = 0; col < size - 1; col++) {
+      const color = modules[row][col];
+      if (modules[row][col + 1] === color && modules[row + 1][col] === color && modules[row + 1][col + 1] === color) {
+        penalty += 3;
+      }
+    }
+  }
+
+  for (let row = 0; row < size; row++) {
+    for (let col = 0; col <= size - 11; col++) {
+      if (isFinderLike(modules[row], col)) penalty += 40;
+    }
+  }
+  for (let col = 0; col < size; col++) {
+    const column = [];
+    for (let row = 0; row < size; row++) column.push(modules[row][col]);
+    for (let row = 0; row <= size - 11; row++) {
+      if (isFinderLike(column, row)) penalty += 40;
+    }
+  }
+
+  let dark = 0;
+  for (let row = 0; row < size; row++) {
+    for (let col = 0; col < size; col++) {
+      if (modules[row][col]) dark++;
+    }
+  }
+  const total = size * size;
+  penalty += Math.floor(Math.abs(dark * 20 - total * 10) / total) * 10;
+
+  return penalty;
+}
+
+function isFinderLike(line, offset) {
+  const patternA = [true, false, true, true, true, false, true, false, false, false, false];
+  const patternB = [false, false, false, false, true, false, true, true, true, false, true];
+  return patternA.every((value, i) => line[offset + i] === value) ||
+    patternB.every((value, i) => line[offset + i] === value);
+}
+
+function chooseQrVersion(byteLength) {
+  for (let version = 1; version <= 40; version++) {
+    const charCountBits = version < 10 ? 8 : 16;
+    if (4 + charCountBits + byteLength * 8 <= QR_L_DATA_CODEWORDS[version - 1] * 8) {
+      return version;
+    }
+  }
+  throw new Error('QR の上限を超えました');
+}
+
+function makeQrDataCodewords(bytes, totalCodewords, version) {
+  const bits = [];
+  const append = (value, len) => {
+    for (let i = len - 1; i >= 0; i--) bits.push(((value >>> i) & 1) !== 0);
+  };
+  append(0x4, 4);
+  append(bytes.length, version < 10 ? 8 : 16);
+  for (const byte of bytes) append(byte, 8);
+  const capacity = totalCodewords * 8;
+  for (let i = 0; i < 4 && bits.length < capacity; i++) bits.push(false);
+  while (bits.length % 8) bits.push(false);
+  const result = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let value = 0;
+    for (let j = 0; j < 8; j++) value = (value << 1) | (bits[i + j] ? 1 : 0);
+    result.push(value);
+  }
+  for (let pad = 0; result.length < totalCodewords; pad++) result.push(pad % 2 ? 0x11 : 0xec);
+  return result;
+}
+
+function drawFinder(setFunc, row, col) {
+  for (let dy = -1; dy <= 7; dy++) {
+    for (let dx = -1; dx <= 7; dx++) {
+      const r = row + dy;
+      const c = col + dx;
+      const dark = 0 <= dx && dx <= 6 && 0 <= dy && dy <= 6 &&
+        (dx === 0 || dx === 6 || dy === 0 || dy === 6 || (2 <= dx && dx <= 4 && 2 <= dy && dy <= 4));
+      setFunc(r, c, dark);
+    }
+  }
+}
+
+function drawAlignment(setFunc, row, col) {
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      setFunc(row + dy, col + dx, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+    }
+  }
+}
+
+function drawFormatBits(setFunc, size, mask) {
+  const bits = bchFormatBits((1 << 3) | mask);
+  for (let i = 0; i < 15; i++) {
+    const dark = bit(bits, i);
+    if (i < 6) setFunc(i, 8, dark);
+    else if (i < 8) setFunc(i + 1, 8, dark);
+    else setFunc(size - 15 + i, 8, dark);
+  }
+  for (let i = 0; i < 15; i++) {
+    const dark = bit(bits, i);
+    if (i < 8) setFunc(8, size - i - 1, dark);
+    else if (i < 9) setFunc(8, 15 - i, dark);
+    else setFunc(8, 14 - i, dark);
+  }
+  setFunc(size - 8, 8, true);
+}
+
+function drawVersionBits(setFunc, size, version) {
+  let rem = version;
+  for (let i = 0; i < 12; i++) rem = (rem << 1) ^ (((rem >>> 11) & 1) ? 0x1f25 : 0);
+  const bits = (version << 12) | rem;
+  for (let i = 0; i < 18; i++) {
+    const dark = bit(bits, i);
+    const a = size - 11 + (i % 3);
+    const b = Math.floor(i / 3);
+    setFunc(a, b, dark);
+    setFunc(b, a, dark);
+  }
+}
+
+function bchFormatBits(data) {
+  let rem = data;
+  for (let i = 0; i < 10; i++) rem = (rem << 1) ^ (((rem >>> 9) & 1) ? 0x537 : 0);
+  return ((data << 10) | rem) ^ 0x5412;
+}
+
+function bit(value, index) {
+  return ((value >>> index) & 1) !== 0;
+}
+
+function rsGenerator(degree) {
+  const result = Array(degree).fill(0);
+  result[degree - 1] = 1;
+  let root = 1;
+  for (let i = 0; i < degree; i++) {
+    for (let j = 0; j < result.length; j++) {
+      result[j] = gfMul(result[j], root);
+      if (j + 1 < result.length) result[j] ^= result[j + 1];
+    }
+    root = gfMul(root, 0x02);
+  }
+  return result;
+}
+
+function rsRemainder(data, generator) {
+  const result = Array(generator.length).fill(0);
+  for (const value of data) {
+    const factor = value ^ result.shift();
+    result.push(0);
+    for (let i = 0; i < generator.length; i++) result[i] ^= gfMul(generator[i], factor);
+  }
+  return result;
+}
+
+function gfMul(x, y) {
+  let z = 0;
+  for (let i = 7; i >= 0; i--) {
+    z = (z << 1) ^ (((z >>> 7) & 1) ? 0x11d : 0);
+    if (((y >>> i) & 1) !== 0) z ^= x;
+  }
+  return z & 0xff;
 }
 
 function copyText(id) {
